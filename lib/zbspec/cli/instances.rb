@@ -21,11 +21,8 @@ module ZBSpec
       def stop_one(cache_dir, pid_file)
         pid = File.read(pid_file).strip.to_i
         name = File.basename(cache_dir)
-        Process.kill(0, pid)
         puts "  Stopping #{name} (PID: #{pid})..."
-        Process.kill('TERM', pid)
-        sleep 0.5
-        Process.kill('KILL', pid) if process_alive?(pid)
+        terminate(pid)
         puts "  ✓ Stopped #{name}"
       rescue Errno::ESRCH
         puts "  ⚠️  #{name} already stopped (stale PID file)"
@@ -33,11 +30,30 @@ module ZBSpec
         File.delete(pid_file)
       end
 
+      def terminate(pid)
+        if windows?
+          system('taskkill', '/PID', pid.to_s, '/T', '/F', out: File::NULL, err: File::NULL)
+        else
+          Process.kill('TERM', pid)
+          sleep 0.5
+          Process.kill('KILL', pid) if process_alive?(pid)
+        end
+      end
+
       def process_alive?(pid)
-        Process.kill(0, pid)
-        true
-      rescue Errno::ESRCH
+        if windows?
+          out = `tasklist /FI "PID eq #{pid}" /NH /FO CSV 2>NUL`
+          out.include?(pid.to_s)
+        else
+          Process.kill(0, pid)
+          true
+        end
+      rescue Errno::ESRCH, Errno::EINVAL
         false
+      end
+
+      def windows?
+        RUBY_PLATFORM.include?('mingw') || RUBY_PLATFORM.include?('mswin')
       end
 
       def discover_cache_dirs(mode, game_version: nil)

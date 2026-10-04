@@ -59,6 +59,12 @@ module ZBSpec
       cfg['instance_name'] = 'client'
       # Client connects to localhost
       cfg['server_ip'] = '127.0.0.1'
+      # PZ 42.21 ConnectToServerState.TestTCP() force-disconnects a client that
+      # runs with `-debug` when the server-assigned role lacks the
+      # ConnectWithDebug capability (message "connect-debug-used"). The default
+      # "user" role does not grant it, so a test client launched with -debug is
+      # rejected. The MP client does not need debug mode, so never pass -debug.
+      cfg['debug'] = false
       Config.new(nil).tap { |c| c.merge!(cfg) }
     end
 
@@ -80,17 +86,32 @@ module ZBSpec
 
     def launch_instances_parallel
       puts "\n🚀 Launching instances..." if @verbosity > 0
-      
-      threads = []
-      threads << Thread.new do
+
+      # The server picks and persists its game port while launching, and the
+      # client must dial that exact port. Starting the server first (and waiting
+      # for its persisted port) removes the race where the client would fall
+      # back to a default port.
+      server_thread = Thread.new do
         @server_launcher.start
         puts "  ✓ Server started (PID: #{@server_launcher.pid})" if @verbosity > 0
       end
-      threads << Thread.new do
-        @client_launcher.start
-        puts "  ✓ Client started (PID: #{@client_launcher.pid})" if @verbosity > 0
+
+      wait_for_server_port(server_thread)
+
+      @client_launcher.start
+      puts "  ✓ Client started (PID: #{@client_launcher.pid})" if @verbosity > 0
+      server_thread.join
+    end
+
+    # Wait until the server has persisted its game port (or it failed to start).
+    def wait_for_server_port(server_thread, timeout: 30)
+      deadline = Time.now + timeout
+      while Time.now < deadline
+        break unless server_thread.alive?
+        port = @server_launcher.send(:server_persisted_port)
+        break if port
+        sleep 0.2
       end
-      threads.each(&:join)
     end
 
     def print_startup_banner
