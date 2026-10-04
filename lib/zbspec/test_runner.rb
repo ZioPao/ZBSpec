@@ -80,6 +80,8 @@ module ZBSpec
         end
         lua_code += "---FILE:spec/spec_helper.lua---\n#{spec_helper_code}" unless spec_helper_code.empty?
         spec_content = File.read(spec_file)
+        next if spec_content.strip.split("\n").all?{ |line| line.strip.start_with?('--') || line.strip.empty? } # Skip fully commented/empty spec files (treat as 0 tests, pass)
+
         warn_missing_run(spec_file) unless has_run_call?(spec_content)
 
         lua_code += "---FILE:#{spec_file}---\n#{spec_content}"

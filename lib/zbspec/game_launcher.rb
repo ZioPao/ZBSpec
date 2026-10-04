@@ -281,7 +281,7 @@ module ZBSpec
         'experimental',
         'lua_server_port=random',
         'prop_prefix=zb',
-        'expose_classes=me.zed_0xff.zombie_buddy.Accessor,me.zed_0xff.zombie_buddy.Exposer'
+        'expose_classes=me.zed_0xff.zombie_buddy.Reflect,me.zed_0xff.zombie_buddy.Exposer'
       ]
       if @verbosity > 0
         agent_parts << "verbosity=#{@verbosity}"

@@ -364,7 +364,7 @@ module ZBSpec
           if process_pid && !process_alive?(process_pid)
             raise APIError, "Process (PID #{process_pid}) terminated before player spawned"
           end
-          player = execute('return getPlayer() ~= nil')
+          player = execute('return getPlayer ~= nil and getPlayer() ~= nil')
           if player
             log "✓ Player spawned"
             return true

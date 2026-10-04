@@ -1,6 +1,6 @@
 package me.zed_0xff.zbspec;
 
-import me.zed_0xff.zombie_buddy.Patch;
+import me.zed_0xff.zombie_buddy.annotations.Patch;
 
 /**
  * Patch for zombie.gameStates.GameLoadingState to force the loading screen to complete quickly.
@@ -17,7 +17,7 @@ public class Patch_GameLoadingState {
         public static boolean msgShown = false;
         
         @Patch.OnEnter
-        public static void enter(@Patch.FieldRW({"forceDone", "bForceDone"}) boolean forceDone) {
+        public static void enter(@Patch.Field({"forceDone", "bForceDone"}) boolean forceDone) {
             forceDone = true;
 
             if (!msgShown) {

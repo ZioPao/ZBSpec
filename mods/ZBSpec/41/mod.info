@@ -1,8 +1,10 @@
 name=ZBSpec
 id=ZBSpec
+
 author=Zed
-url=https://github.com/zed-0xff
+url=https://github.com/zed-0xff/ZBSpec
+patreon=https://patreon.com/zed_0xff
 
 javaJarFile=media/java/shared/ZBSpec.jar
 javaPkgName=me.zed_0xff.zbspec
-ZBVersionMin=2.4.0
+ZBVersionMin=3.0.0
