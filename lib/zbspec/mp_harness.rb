@@ -87,6 +87,12 @@ module ZBSpec
     def launch_instances_parallel
       puts "\n🚀 Launching instances..." if @verbosity > 0
 
+      # A previous run that failed under `shutdown: auto` (or was killed) can
+      # leave the games running. Reusing a stale server while we delete its
+      # API-port file below would hang, and the stale world is not what we want
+      # to test, so stop anything recorded in the cache pid files first.
+      stop_stale_instances
+
       # Remove the previous run's ZombieBuddy API-port file *before* the server
       # starts, otherwise wait_for_server_ready below would see the stale file
       # and release the client before the server has even booted.
@@ -122,6 +128,26 @@ module ZBSpec
       File.delete(path) if File.exist?(path)
     rescue StandardError
       nil
+    end
+
+    # Kill any game processes recorded in the server/client cache pid files.
+    def stop_stale_instances
+      [@server_launcher, @client_launcher].each do |launcher|
+        begin
+          pid_file = launcher.pid_file
+          next unless File.exist?(pid_file)
+
+          pid = File.read(pid_file).strip.to_i
+          if pid.positive? && launcher.send(:process_alive?, pid)
+            puts "  ⚠ Stopping stale instance (PID: #{pid})" if @verbosity > 0
+            launcher.send(:terminate_process, pid)
+            sleep 0.5
+          end
+          File.delete(pid_file) if File.exist?(pid_file)
+        rescue StandardError
+          nil
+        end
+      end
     end
 
     # Wait until the server has persisted its game port (or it failed to start).
