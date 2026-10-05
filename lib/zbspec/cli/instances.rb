@@ -56,8 +56,25 @@ module ZBSpec
         RUBY_PLATFORM.include?('mingw') || RUBY_PLATFORM.include?('mswin')
       end
 
+      # Roots that may contain cache_* dirs: the default ./tmp plus the configured
+      # cache_root (see spec/zbspec.yml). Read directly so --stop/--restart keep
+      # working without plumbing the config through every caller.
+      def cache_glob_roots
+        roots = ['tmp']
+        begin
+          require 'yaml'
+          cfg = YAML.safe_load(File.read('spec/zbspec.yml')) || {}
+          root = cfg['cache_root']
+          roots << File.expand_path(root.to_s) if root && !root.to_s.strip.empty?
+        rescue StandardError
+          nil
+        end
+        roots
+      end
+
       def discover_cache_dirs(mode, game_version: nil)
-        all = Dir.glob('tmp/cache_*').select { |d| File.directory?(d) }.sort
+        all = cache_glob_roots.flat_map { |root| Dir.glob(File.join(root, 'cache_*')) }
+                             .select { |d| File.directory?(d) }.sort
         filter = { sp: 'cache_sp_', server: 'cache_server_', client: 'cache_client_' }
         dirs = case mode
         when :sp then all.select { |d| d.include?(filter[:sp]) }

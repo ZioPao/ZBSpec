@@ -1,10 +1,12 @@
 # frozen_string_literal: true
 
+require 'fileutils'
+
 module ZBSpec
   # Multiplayer test harness - manages both server and client
   class MPHarness
-    attr_reader :config, :server_launcher, :client_launcher
-    attr_reader :server_api, :client_api, :verbosity
+    attr_reader :config, :server_launcher, :client_launcher, :client2_launcher
+    attr_reader :server_api, :client_api, :client2_api, :verbosity
 
     def initialize(config_path: nil, spec_files: nil, verbosity: 0, client_only: false, config_overrides: {})
       @config = Config.new(config_path)
@@ -17,11 +19,19 @@ module ZBSpec
       # Create separate launchers for server and client
       @server_launcher = GameLauncher.new(server_config, label: 'server', verbosity: verbosity)
       @client_launcher = GameLauncher.new(client_config, label: 'client', verbosity: verbosity)
+      @client2_launcher = GameLauncher.new(client2_config, label: 'client2', verbosity: verbosity) if two_clients?
 
       # Create API clients for each
       sandbox = @config['sandbox']
       @server_api = APIClient.new(port_file: server_port_file, label: 'server', verbosity: verbosity, sandbox: sandbox)
       @client_api = APIClient.new(port_file: client_port_file, label: 'client', verbosity: verbosity, sandbox: sandbox)
+      @client2_api = APIClient.new(port_file: client2_port_file, label: 'client2', verbosity: verbosity, sandbox: sandbox) if two_clients?
+    end
+
+    # Launch a second MP client when `mp_clients: 2` is configured (for
+    # surgeon<->patient relay tests). Defaults to a single client.
+    def two_clients?
+      @config['mp_clients'].to_i > 1
     end
 
     def run
@@ -53,10 +63,18 @@ module ZBSpec
     end
 
     def client_config
+      client_config_for('client')
+    end
+
+    def client2_config
+      client_config_for('client2')
+    end
+
+    def client_config_for(kind)
       cfg = @config.to_h.dup
       cfg['server_mode'] = false
-      cfg['cache_dir'] = client_cache_dir
-      cfg['instance_name'] = 'client'
+      cfg['cache_dir'] = cache_dir_for(kind)
+      cfg['instance_name'] = kind
       # Client connects to localhost
       cfg['server_ip'] = '127.0.0.1'
       # PZ 42.21 ConnectToServerState.TestTCP() force-disconnects a client that
@@ -69,11 +87,28 @@ module ZBSpec
     end
 
     def server_cache_dir
-      File.expand_path("./tmp/cache_server_#{game_version_name}")
+      cache_dir_for('server')
     end
 
     def client_cache_dir
-      File.expand_path("./tmp/cache_client_#{game_version_name}")
+      cache_dir_for('client')
+    end
+
+    def client2_cache_dir
+      cache_dir_for('client2')
+    end
+
+    # Cache dirs live outside the mod directory when `cache_root` is configured.
+    # Keeping them under ./tmp (inside the mod, which itself sits in
+    # ~/Zomboid/mods) makes PZ's mod scanner pick up the cached mod copy and
+    # build bogus script paths.
+    def cache_dir_for(kind)
+      root = @config['cache_root']
+      if root && !root.to_s.strip.empty?
+        File.join(File.expand_path(root.to_s), "cache_#{kind}_#{game_version_name}")
+      else
+        File.expand_path("./tmp/cache_#{kind}_#{game_version_name}")
+      end
     end
 
     def server_port_file
@@ -82,6 +117,10 @@ module ZBSpec
 
     def client_port_file
       File.join(client_cache_dir, 'zbLuaAPI.txt')
+    end
+
+    def client2_port_file
+      File.join(client2_cache_dir, 'zbLuaAPI.txt')
     end
 
     def launch_instances_parallel
@@ -118,9 +157,26 @@ module ZBSpec
       # depending on the server's Lua thread) and let the listener settle.
       wait_for_server_ready(server_thread)
 
+      # Per-instance login credentials (a second client must use a distinct
+      # username or the server rejects it as "AlreadyConnected").
+      write_client_credentials(client_cache_dir, 'admin', 'zbspec')
       @client_launcher.start
       puts "  ✓ Client started (PID: #{@client_launcher.pid})" if @verbosity > 0
+
+      if two_clients?
+        write_client_credentials(client2_cache_dir, 'zbspec2', 'zbspec')
+        @client2_launcher.start
+        puts "  ✓ Client2 started (PID: #{@client2_launcher.pid})" if @verbosity > 0
+      end
+
       server_thread.join
+    end
+
+    # Write the credentials the MP autoconnect mod reads from the Lua cache dir.
+    def write_client_credentials(cache_dir, username, password)
+      lua_dir = File.join(cache_dir, 'Lua')
+      FileUtils.mkdir_p(lua_dir)
+      File.write(File.join(lua_dir, 'zb_mp_credentials.txt'), "#{username}\n#{password}\n")
     end
 
     def remove_stale_api_port_file
@@ -132,7 +188,7 @@ module ZBSpec
 
     # Kill any game processes recorded in the server/client cache pid files.
     def stop_stale_instances
-      [@server_launcher, @client_launcher].each do |launcher|
+      [@server_launcher, @client_launcher, @client2_launcher].compact.each do |launcher|
         begin
           pid_file = launcher.pid_file
           next unless File.exist?(pid_file)
@@ -220,7 +276,21 @@ module ZBSpec
       rescue => e
         client_error = e
       end
-      
+
+      if two_clients?
+        threads << Thread.new do
+          sleep 0.5 until server_ready
+          @client2_api.discover_port(timeout: client_timeout, process_pid: @client2_launcher.pid)
+          @client2_api.wait_for_ready(timeout: client_timeout, process_pid: @client2_launcher.pid)
+          @client2_api.wait_for_player(timeout: client_timeout, process_pid: @client2_launcher.pid)
+          is_client = @client2_api.execute('return isClient()')
+          raise "Client2 instance is not running as client! isClient()=#{is_client}" unless is_client
+          puts "  ✓ Client2 ready" if @verbosity > 0
+        rescue => e
+          client_error = e
+        end
+      end
+
       threads.each(&:join)
       raise client_error if client_error
     end
@@ -244,7 +314,7 @@ module ZBSpec
     def run_specs
       results = TestResults.new
 
-      [@server_api, @client_api].each { |api| api.execute(GAME_SPEED_UNPAUSE) } if @config['unpause'] != false
+      [@server_api, @client_api, @client2_api].compact.each { |api| api.execute(GAME_SPEED_UNPAUSE) } if @config['unpause'] != false
       wait_for_ready_condition
 
       # Determine which specs to run where
@@ -271,6 +341,9 @@ module ZBSpec
 
       # Run specs on client
       if client_specs.any?
+        # Let the server settle after the server specs before the client drives
+        # it (the first client->server eval can otherwise be slow).
+        sleep 3
         puts "\n🧪 Running Client Specs (#{client_specs.length} files)\n" + '-' * 30 if @verbosity >= 0
         client_runner = TestRunner.new(@client_api, client_config, spec_files: client_specs, verbosity: @verbosity)
         client_results = client_runner.run_all
@@ -286,7 +359,7 @@ module ZBSpec
 
       results
     ensure
-      [@server_api, @client_api].each { |api| api.execute(GAME_SPEED_PAUSE) } if @config['pause'] != false
+      [@server_api, @client_api, @client2_api].compact.each { |api| api.execute(GAME_SPEED_PAUSE) } if @config['pause'] != false
     end
 
     def extract_tests(results)
@@ -304,6 +377,7 @@ module ZBSpec
       should_stop = shutdown_val == 'always' || (shutdown_val == 'auto' && @last_results && !@last_results.failed?)
       return unless should_stop
       puts "\n🛑 Shutting down..."
+      @client2_launcher.stop if @client2_launcher&.running?
       @client_launcher.stop if @client_launcher&.running?
       @server_launcher.stop if @server_launcher&.running?
     end
@@ -311,7 +385,7 @@ module ZBSpec
     def handle_error(error)
       puts "\n❌ Fatal error: #{error.message}"
       if error.message.include?('terminated before API')
-        [@server_launcher, @client_launcher].compact.each do |launcher|
+        [@server_launcher, @client_launcher, @client2_launcher].compact.each do |launcher|
           std_log = File.join(launcher.get_cache_dir, 'std.log')
           next unless File.exist?(std_log)
           lines = File.readlines(std_log).last(50)
@@ -321,6 +395,7 @@ module ZBSpec
       else
         puts error.backtrace.first(10)
       end
+      @client2_launcher.stop if @client2_launcher&.running?
       @client_launcher.stop if @client_launcher&.running?
       @server_launcher.stop if @server_launcher&.running?
       exit 1

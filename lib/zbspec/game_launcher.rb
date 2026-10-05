@@ -527,17 +527,28 @@ module ZBSpec
 
     def default_cache_dir
       v = game_version_name
-      if config['server_mode']
-        "./tmp/cache_server_#{v}"
-      elsif config['server_ip']
-        "./tmp/cache_client_#{v}"
+      kind = if config['server_mode']
+               'server'
+             elsif config['server_ip']
+               'client'
+             else
+               'sp'
+             end
+      root = config['cache_root']
+      if root && !root.to_s.strip.empty?
+        File.join(File.expand_path(root.to_s), "cache_#{kind}_#{v}")
       else
-        "./tmp/cache_sp_#{v}"
+        "./tmp/cache_#{kind}_#{v}"
       end
     end
 
     def server_cache_dir_for_version(version_name)
-      File.expand_path("./tmp/cache_server_#{version_name}")
+      root = config['cache_root']
+      if root && !root.to_s.strip.empty?
+        File.join(File.expand_path(root.to_s), "cache_server_#{version_name}")
+      else
+        File.expand_path("./tmp/cache_server_#{version_name}")
+      end
     end
 
     def game_versions_root
@@ -638,7 +649,7 @@ module ZBSpec
         if entry['path']
           src = File.expand_path(entry['path'])
           raise GameLaunchError, "Mod path not found: #{entry['path']} (resolved: #{src})" unless File.exist?(src)
-          link_dir(src, mod_link)
+          link_mod_dir(src, mod_link)
         elsif (steam_id = entry['steam_id'])
           mod_mods_path = steam_workshop_mods_path(steam_id)
           unless File.exist?(mod_mods_path)
@@ -674,6 +685,28 @@ module ZBSpec
         rescue StandardError
           FileUtils.cp_r(src, dst)
         end
+      end
+    end
+
+    # Non-mod entries that must never be linked into the cache mod dir.
+    MOD_LINK_EXCLUDE = %w[.git .github .vscode .opencode dev_stuff graphify-out node_modules tmp].freeze
+
+    # Copy a mod's *content* into +dst+, excluding non-mod directories (tmp,
+    # .git, ...). We copy rather than symlink: PZ's ScriptManager mis-resolves
+    # script paths through symlinked content dirs (it builds a bogus absolute
+    # path and prepends the mods dir), so item/clothing scripts never load.
+    # Excluding tmp/.git also avoids the cache-in-mod-directory symlink loop.
+    def link_mod_dir(src, dst)
+      src = File.expand_path(src.to_s)
+      FileUtils.rm_rf(dst)
+      FileUtils.mkdir_p(dst)
+
+      Dir.children(src).sort.each do |name|
+        next if MOD_LINK_EXCLUDE.include?(name)
+
+        entry_src = File.join(src, name)
+        entry_dst = File.join(dst, name)
+        FileUtils.cp_r(entry_src, entry_dst)
       end
     end
 
