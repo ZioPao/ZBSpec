@@ -87,6 +87,11 @@ module ZBSpec
     def launch_instances_parallel
       puts "\n🚀 Launching instances..." if @verbosity > 0
 
+      # Remove the previous run's ZombieBuddy API-port file *before* the server
+      # starts, otherwise wait_for_server_ready below would see the stale file
+      # and release the client before the server has even booted.
+      remove_stale_api_port_file
+
       # The server picks and persists its game port while launching, and the
       # client must dial that exact port. Starting the server first (and waiting
       # for its persisted port) removes the race where the client would fall
@@ -98,9 +103,25 @@ module ZBSpec
 
       wait_for_server_port(server_thread)
 
+      # The persisted game-port file is written before the server process boots,
+      # so on a slow server start the client could autoconnect (a single,
+      # non-retried attempt made the instant PZ shows the connect popup) before
+      # RakNet has bound -> "connection-attempt-failed", no player, hard timeout.
+      # The ZombieBuddy API-port file is written at onGameInitComplete, just
+      # before RakNet binds, so wait for it (file poll, not an API call, to avoid
+      # depending on the server's Lua thread) and let the listener settle.
+      wait_for_server_ready(server_thread)
+
       @client_launcher.start
       puts "  ✓ Client started (PID: #{@client_launcher.pid})" if @verbosity > 0
       server_thread.join
+    end
+
+    def remove_stale_api_port_file
+      path = File.join(server_cache_dir, 'zbLuaAPI.txt')
+      File.delete(path) if File.exist?(path)
+    rescue StandardError
+      nil
     end
 
     # Wait until the server has persisted its game port (or it failed to start).
@@ -110,6 +131,26 @@ module ZBSpec
         break unless server_thread.alive?
         port = @server_launcher.send(:server_persisted_port)
         break if port
+        sleep 0.2
+      end
+    end
+
+    # Block until the server's ZombieBuddy API-port file is (re)written (at
+    # onGameInitComplete, immediately before RakNet binds), then give the RakNet
+    # listener a moment to bind. The stale file is removed before launch, so its
+    # (re)appearance means the server has booted. Polling the file keeps this
+    # independent of the server's Lua thread, which is not necessarily
+    # responsive during boot.
+    def wait_for_server_ready(_server_thread, timeout: nil)
+      timeout ||= @config['server_startup_timeout'] || 60
+      path = File.join(server_cache_dir, 'zbLuaAPI.txt')
+      deadline = Time.now + timeout
+      loop do
+        if File.exist?(path) && File.read(path).strip =~ /^\d+$/
+          sleep 1.5
+          return
+        end
+        raise "Server API port not written after #{timeout}s (file: #{path})" if Time.now > deadline
         sleep 0.2
       end
     end
