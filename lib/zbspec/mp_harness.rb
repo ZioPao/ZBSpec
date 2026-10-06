@@ -14,7 +14,7 @@ module ZBSpec
       @verbosity = verbosity
       @spec_files = spec_files
       @client_only = client_only
-      @discovery = SpecDiscovery.new
+      @discovery = SpecDiscovery.new(spec_dir: @config['spec_dir'] || 'spec')
 
       # Create separate launchers for server and client
       @server_launcher = GameLauncher.new(server_config, label: 'server', verbosity: verbosity)

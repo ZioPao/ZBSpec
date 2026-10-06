@@ -689,7 +689,7 @@ module ZBSpec
     end
 
     # Non-mod entries that must never be linked into the cache mod dir.
-    MOD_LINK_EXCLUDE = %w[.git .github .vscode .opencode dev_stuff graphify-out node_modules tmp].freeze
+    MOD_LINK_EXCLUDE = %w[.git .github .vscode .opencode dev_stuff tests graphify-out node_modules tmp].freeze
 
     # Copy a mod's *content* into +dst+, excluding non-mod directories (tmp,
     # .git, ...). We copy rather than symlink: PZ's ScriptManager mis-resolves

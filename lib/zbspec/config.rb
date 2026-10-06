@@ -23,6 +23,7 @@ module ZBSpec
       'game_versions' => ['default'],
       'debug' => true,
       'mods' => [],
+      'spec_dir' => 'spec',             # folder holding client/ server/ shared/ specs
       'spec_glob' => 'spec/**/*_spec.lua',
       'helpers' => [],                  # Lua file names from ZBSpec/lua/, loaded before spec/spec_helper.lua
       'sandbox' => false,               # Lua execution env: true = request-scoped env, false = global _G
