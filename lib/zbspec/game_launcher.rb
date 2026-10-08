@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require 'fileutils'
 require 'erb'
+require 'shellwords'
 
 module ZBSpec
   # Handles launching and stopping the game
@@ -112,7 +113,7 @@ module ZBSpec
         spawn_opts[:out] = spawn_opts[:err] = log_file if log_file
         log format_argv_multiline(args) if @verbosity > 0
         log "Launching with args: #{args.inspect}" if @verbosity <= 0
-        @launch_env ||= {}
+        @launch_env = (@launch_env || {}).merge(stringified_env)
         @pid = spawn(@launch_env, *args, **spawn_opts)
       end
       @running = true
@@ -215,6 +216,9 @@ module ZBSpec
     end
 
     def resolve_game_root
+      if config['server_mode'] && (server_path = config['server_path']).to_s.strip != ''
+        return File.expand_path(server_path.to_s)
+      end
       version_dir = File.join(game_versions_root, game_version_name)
       base = File.directory?(version_dir) ? version_dir : config['game_path']
       raise GameLaunchError, 'Project Zomboid path not configured. Set game_path in spec/zbspec.yml.' unless base
@@ -253,12 +257,84 @@ module ZBSpec
     def build_launch_args(log_file: nil)
       if mac?
         @mac_java_home, @mac_game_root = resolve_mac_paths
-        game_exe = find_executable
-        config['same_console'] ? build_mac_direct_args(game_exe) : build_mac_launch_args(game_exe, log_file: log_file)
       else
         @game_root = resolve_game_root
-        build_other_launch_args(find_executable)
       end
+
+      return build_custom_launch_args(log_file: log_file) if custom_launch?
+
+      game_exe = find_executable
+      if mac?
+        config['same_console'] ? build_mac_direct_args(game_exe) : build_mac_launch_args(game_exe, log_file: log_file)
+      else
+        build_other_launch_args(game_exe)
+      end
+    end
+
+    # True when the config replaces the built-in argv with a literal command or
+    # a wrapper script/binary.
+    def custom_launch?
+      !Array(config['launch_command']).empty? || config['launcher'].to_s.strip != ''
+    end
+
+    # Config-driven launch: either a full argv (`launch_command`, with
+    # placeholders) or a wrapper script/binary (`launcher`). Mods are still
+    # linked into the cache dir and the ZombieBuddy agent must be injected by the
+    # caller via ${AGENT} (launch_command) — a `launcher` script manages its own.
+    def build_custom_launch_args(log_file: nil)
+      cache_dir = File.expand_path(config['cache_dir'] || default_cache_dir)
+      init_cachedir(cache_dir)
+      @launch_env = stringified_env
+
+      argv =
+        if config['launcher'].to_s.strip != ''
+          launcher_command(config['launcher'])
+        else
+          expand_launch_placeholders(launch_command_argv, cache_dir)
+        end
+
+      log format_argv_multiline(argv) if @verbosity > 0
+      argv
+    end
+
+    def launch_command_argv
+      cmd = config['launch_command']
+      return cmd.map(&:to_s) if cmd.is_a?(Array)
+      Shellwords.split(cmd.to_s)
+    end
+
+    def launcher_command(launcher)
+      path = File.expand_path(launcher.to_s, game_root.to_s)
+      extra = Array(config['server_mode'] ? config['server_args'] : config['client_args']).map(&:to_s)
+      if windows? && path.match?(/\.(bat|cmd)\z/i)
+        ['cmd', '/c', path, *extra]
+      else
+        [path, *extra]
+      end
+    end
+
+    # Replace ${NAME} placeholders in every argument. Unknown placeholders are
+    # left untouched so typos surface in the logged command.
+    def expand_launch_placeholders(argv, cache_dir)
+      vars = {
+        'JAVA' => bundled_java_path,
+        'GAME' => launch_chdir.to_s,
+        'CACHEDIR' => cache_dir.to_s,
+        'SERVERNAME' => (config['server_name'] || 'ZBSpecServer').to_s,
+        'ADMINPASSWORD' => (config['admin_password'] || 'zbspec').to_s,
+        'PORT' => config['server_port'].to_s,
+        'AGENT' => agent_option.to_s
+      }
+      argv.map do |arg|
+        arg.gsub(/\$\{(\w+)\}/) { vars[Regexp.last_match(1)] || Regexp.last_match(0) }
+      end
+    end
+
+    # Bundled JVM used by the built-in launcher, for the ${JAVA} placeholder.
+    def bundled_java_path
+      return File.join(@mac_java_home.to_s, 'bin', 'java') if mac?
+      exe = windows? ? 'java.exe' : 'java'
+      File.join(unix_install_dir, 'jre64', 'bin', exe)
     end
 
     def build_mac_launch_args(java_bin, log_file: nil)
@@ -291,7 +367,7 @@ module ZBSpec
     # argv for run.sh: first = java binary, rest = JVM + game args
     def build_java_argv(java_bin, cache_dir)
       jars = Dir[File.join(@mac_game_root, '*.jar')].map { |f| File.basename(f) }
-      classpath = (jars + ['.']).join(':')
+      classpath = classpath_override((jars + ['.']).join(':'))
 
       java_lib_paths = [
         ".",
@@ -304,27 +380,36 @@ module ZBSpec
         '--enable-native-access=ALL-UNNAMED',
         '-Djava.awt.headless=true',
         '-XstartOnFirstThread',
-        '-Dzomboid.steam=0',
+        "-Dzomboid.steam=#{steam? ? 1 : 0}",
         '-Dzomboid.znetlog=1',
         '-Xmx3072m',
         '-XX:+UseZGC',
         '-XX:-OmitStackTraceInFastThrow',
+        *Array(config['jvm_args']).map(&:to_s),
         "-Djava.library.path=#{java_lib_paths.join(':')}",
         "-Dzb.config_dir=#{cache_dir}/.zombie_buddy",
         agent_option,
         '-classpath', classpath
       ]
+      argv << '-Ddebug=1' if config['debug'] != false && config['debug_jvm']
 
-      argv << (config['server_mode'] ? 'zombie.network.GameServer' : 'zombie.gameStates.MainScreenState')
+      main_class = effective_main_class(nil)
+      argv << main_class
       argv << '--'
       argv << "-cachedir=#{cache_dir}"
 
       if config['server_mode']
         server_name = config['server_name'] || 'ZBSpecServer'
-        argv << server_name << '-nosteam' << '-adminpassword' << (config['admin_password'] || 'zbspec')
+        argv << server_name
+        argv << '-nosteam' unless steam?
+        argv << '-adminpassword' << (config['admin_password'] || 'zbspec')
+        argv.concat(Array(config['server_args']).map(&:to_s))
       else
-        argv.concat(['-novoip', '-nosound', '-nosteam', '-no-worldgen', '-no-foraging', '-no-attachments'])
+        argv.concat(['-novoip', '-nosound'])
+        argv << '-nosteam' unless steam?
+        argv.concat(['-no-worldgen', '-no-foraging', '-no-attachments'])
         argv << '-debug' unless config['debug'] == false
+        argv.concat(Array(config['client_args']).map(&:to_s))
         if config['server_ip']
           ip = config['server_ip']
           port = config['server_port'] || read_server_game_port || 16261
@@ -359,16 +444,26 @@ module ZBSpec
 
     def build_windows_launch_args(game_exe, cache_dir)
       if config['server_mode']
-        @launch_env = jvm_options_env([agent_option])
+        jvm = Array(config['jvm_args']).map(&:to_s)
+        jvm << '-Ddebug=1' if config['debug'] != false && config['debug_jvm']
+        @launch_env = jvm_options_env([agent_option] + jvm)
         server_name = config['server_name'] || 'ZBSpecServer'
-        return [game_exe, "-cachedir=#{cache_dir}", server_name, '-nosteam',
-                '-adminpassword', (config['admin_password'] || 'zbspec')]
+        args = [game_exe, "-cachedir=#{cache_dir}", server_name]
+        args << '-nosteam' unless steam?
+        args.concat(['-adminpassword', (config['admin_password'] || 'zbspec')])
+        args.concat(Array(config['server_args']).map(&:to_s))
+        return args
       end
 
-      args = [game_exe, "-Dzb.config_dir=#{cache_dir}/.zombie_buddy", agent_option, '--',
+      jvm = Array(config['jvm_args']).map(&:to_s)
+      jvm << '-Ddebug=1' if config['debug'] != false && config['debug_jvm']
+      args = [game_exe, "-Dzb.config_dir=#{cache_dir}/.zombie_buddy", agent_option, *jvm, '--',
               "-cachedir=#{cache_dir}"]
-      args.concat(['-novoip', '-nosound', '-nosteam', '-no-worldgen', '-no-foraging', '-no-attachments'])
+      args.concat(['-novoip', '-nosound'])
+      args << '-nosteam' unless steam?
+      args.concat(['-no-worldgen', '-no-foraging', '-no-attachments'])
       args << '-debug' unless config['debug'] == false
+      args.concat(Array(config['client_args']).map(&:to_s))
       append_client_connect_args(args)
       args
     end
@@ -378,18 +473,22 @@ module ZBSpec
       java_bin = File.join(install_dir, 'jre64', 'bin', 'java')
       raise GameLaunchError, "Bundled java not found: #{java_bin}" unless File.exist?(java_bin)
 
-      vm_args, classpath, main_class = read_pzexe_config(install_dir)
+      vm_args, classpath, json_main_class = read_pzexe_config(install_dir)
+      classpath = classpath_override(classpath)
       # Force offline/test-friendly properties regardless of the JSON defaults.
       vm_args.reject! { |a| a.start_with?('-Dzomboid.steam=', '-Djava.awt.headless=') }
-      vm_args << '-Dzomboid.steam=0'
-      vm_args << '-Djava.awt.headless=false'
+      vm_args << "-Dzomboid.steam=#{steam? ? 1 : 0}"
+      vm_args << "-Djava.awt.headless=#{headless?}"
+      vm_args << '-Ddebug=1' if config['debug'] != false && config['debug_jvm']
       vm_args << "-Dzb.config_dir=#{cache_dir}/.zombie_buddy"
       vm_args << agent_option
-      # Dedicated server uses the GameServer main class.
-      main_class = 'zombie.network.GameServer' if config['server_mode']
+      vm_args.concat(Array(config['jvm_args']).map(&:to_s))
+      main_class = effective_main_class(json_main_class)
 
-      # Mirror the official wrapper's native library environment.
-      natives = File.join(install_dir, 'natives')
+      # Mirror the official wrapper's native library environment. The native
+      # dir differs between the client (`natives/`) and the dedicated server
+      # (`linux64/` / `win64/`).
+      natives = native_lib_dir(install_dir)
       lib_paths = [natives, install_dir, File.join(install_dir, 'jre64', 'lib')]
       @launch_env = {
         'LD_LIBRARY_PATH' => (lib_paths + [ENV['LD_LIBRARY_PATH']]).compact.reject(&:empty?).join(':'),
@@ -402,14 +501,19 @@ module ZBSpec
       args = [java_bin] + vm_args + ['-classpath', classpath, main_class, '--']
       if config['server_mode']
         server_name = config['server_name'] || 'ZBSpecServer'
-        args.concat(["-cachedir=#{cache_dir}", server_name, '-nosteam',
-                     '-adminpassword', (config['admin_password'] || 'zbspec')])
+        args.concat(["-cachedir=#{cache_dir}", server_name])
+        args << '-nosteam' unless steam?
+        args.concat(['-adminpassword', (config['admin_password'] || 'zbspec')])
+        args.concat(Array(config['server_args']).map(&:to_s))
         return args
       end
 
       args << "-cachedir=#{cache_dir}"
-      args.concat(['-novoip', '-nosound', '-nosteam', '-no-worldgen', '-no-foraging', '-no-attachments'])
+      args.concat(['-novoip', '-nosound'])
+      args << '-nosteam' unless steam?
+      args.concat(['-no-worldgen', '-no-foraging', '-no-attachments'])
       args << '-debug' unless config['debug'] == false
+      args.concat(Array(config['client_args']).map(&:to_s))
       append_client_connect_args(args)
       args
     end
@@ -450,6 +554,48 @@ module ZBSpec
       existing = ENV['_JAVA_OPTIONS'].to_s.strip
       merged = ([existing] + options).reject(&:empty?).join(' ')
       { '_JAVA_OPTIONS' => merged }
+    end
+
+    # Non-Steam mode is the default (matches the built-in test launch); set
+    # `steam: true` to pass -Dzomboid.steam=1 and drop -nosteam.
+    def steam?
+      config['steam'] == true
+    end
+
+    # Dedicated servers are headless; clients need a display. Overridable.
+    def headless?
+      return config['headless'] unless config['headless'].nil?
+      !!config['server_mode']
+    end
+
+    # Native library directory, which differs by install type: the client ships
+    # `natives/`, the dedicated server `linux64/` (or `win64/`).
+    def native_lib_dir(install_dir)
+      explicit = config['natives_dir'].to_s.strip
+      return File.join(install_dir, explicit) unless explicit.empty?
+      %w[natives linux64 win64].each do |name|
+        dir = File.join(install_dir, name)
+        return dir if File.directory?(dir)
+      end
+      File.join(install_dir, 'natives')
+    end
+
+    def classpath_override(fallback)
+      cp = config['classpath']
+      return fallback if cp.nil?
+      return cp if cp.is_a?(String)
+      Array(cp).join(':')
+    end
+
+    def effective_main_class(json_main_class)
+      override = config['main_class'].to_s.strip
+      return override unless override.empty?
+      return 'zombie.network.GameServer' if config['server_mode']
+      json_main_class.to_s.empty? ? 'zombie.gameStates.MainScreenState' : json_main_class
+    end
+
+    def stringified_env
+      (config['env'] || {}).each_with_object({}) { |(k, v), h| h[k.to_s] = v.to_s }
     end
 
     def agent_option
@@ -500,11 +646,14 @@ module ZBSpec
           # Next to the game launcher (recommended install location on Win/Linux).
           game_root && File.join(game_root, 'ZombieBuddy.jar'),
           game_root && File.join(game_root, 'projectzomboid', 'ZombieBuddy.jar'),
+          # When the server launches from a separate server_path, fall back to
+          # the client install's ZombieBuddy.
+          game_path_jar_candidates,
           File.expand_path('~/projects/zomboid/mods/ZombieBuddy/libs/ZombieBuddy.jar'),
           File.expand_path('~/Zomboid/mods/ZombieBuddy/libs/ZombieBuddy.jar'),
           File.expand_path('~/Library/Application Support/Steam/steamapps/workshop/content/108600/3619862853/mods/ZombieBuddy/libs/ZombieBuddy.jar'),
           steam_workshop_jar_path,
-        ].compact
+        ].flatten.compact
         path = candidates.find { |p| File.file?(p) }
         unless path
           raise GameLaunchError, "ZombieBuddy.jar not found. Checked:\n  #{candidates.join("\n  ")}"
@@ -518,6 +667,18 @@ module ZBSpec
       mods_path = steam_workshop_mods_path('3619862853')
       return nil unless mods_path
       File.join(mods_path, 'ZombieBuddy', 'libs', 'ZombieBuddy.jar')
+    end
+
+    # ZombieBuddy.jar next to the client install's launcher, used when the
+    # server runs from a separate server_path.
+    def game_path_jar_candidates
+      base = config['game_path'].to_s.strip
+      return [] if base.empty?
+      base = File.expand_path(base)
+      [
+        File.join(base, 'ZombieBuddy.jar'),
+        File.join(base, 'projectzomboid', 'ZombieBuddy.jar')
+      ]
     end
 
     # ZombieBuddy mod root (parent of the directory containing the JAR, e.g. .../ZombieBuddy)
